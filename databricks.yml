@@ -1,0 +1,55 @@
+# Declarative Automation Bundle (DAB) for the IDP document-processing project.
+#
+# Layout:
+#   resources/idp_etl.pipeline.yml  - the Lakeflow declarative ETL pipeline
+#   resources/idp_etl.job.yml       - the job that runs it on new file arrival
+#   src/idp_etl/transformations/    - the pipeline source (bronze -> silver -> gold)
+#
+# Deploy with:  databricks bundle deploy --target dev
+# See https://docs.databricks.com/dev-tools/bundles/index.html
+bundle:
+  name: databricks-idp-test
+
+include:
+  - resources/*.yml
+
+# Assigned per target below. Both targets live in the same workspace and are
+# isolated by catalog, so every catalog/schema/path is target-scoped.
+variables:
+  catalog:
+    description: Unity Catalog catalog that the pipeline writes its tables into.
+  schema:
+    description: Schema within the catalog that holds the output tables.
+  source_path:
+    description: Volume folder watched for incoming documents.
+
+targets:
+  dev:
+    # 'mode: development' prefixes deployed resources with '[dev arijit_de]' and
+    # marks the pipeline as a development pipeline (no full-refresh on redeploy).
+    # It also pauses schedules and triggers by default -- the job's trigger sets
+    # pause_status: UNPAUSED explicitly to keep file-arrival firing in dev.
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-6166fe71-87d7.cloud.databricks.com
+    variables:
+      catalog: idp_test_dev
+      schema: idp_test_project
+      source_path: /Volumes/idp_test_dev/idp_test_project/raw_documents/incoming
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-6166fe71-87d7.cloud.databricks.com
+      # Pinned so that prod has exactly one copy, regardless of who deploys it.
+      root_path: /Workspace/Users/arijit.de@trinamix.com/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: idp_test_prod
+      schema: idp_test_project
+      source_path: /Volumes/idp_test_prod/idp_test_project/raw_documents/incoming
+    run_as:
+      user_name: arijit.de@trinamix.com
+    permissions:
+      - user_name: arijit.de@trinamix.com
+        level: CAN_MANAGE
