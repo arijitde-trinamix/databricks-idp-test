@@ -1,0 +1,144 @@
+# Validates and deploys the databricks-idp-test bundle to its "prod" target.
+#
+# Unlike the reference workflow this was adapted from, the bundle lives at the
+# repository root -- there is no bundle subdirectory -- so every command runs
+# from the checkout root and no working-directory is needed.
+#
+# What a successful deploy leaves behind in the workspace
+# https://dbc-6166fe71-87d7.cloud.databricks.com (dev and prod share this one
+# workspace; they are separated only by Unity Catalog catalog):
+#
+#   pipeline  idp_etl      serverless Lakeflow declarative pipeline,
+#                          catalog idp_test_prod, schema idp_test_project
+#   job       idp_etl_job  carries the file-arrival trigger on
+#                          /Volumes/idp_test_prod/idp_test_project/raw_documents/incoming/
+#   tables    bronze_documents, silver_parsed_documents,
+#             silver_extracted_documents, silver_documents,
+#             silver_document_lines, gold_documents, gold_document_lines,
+#             gold_invoices, gold_purchase_orders, gold_receipts,
+#             gold_vendor_spend, gold_invoice_po_reconciliation
+#
+# Deploying is enough to make the pipeline live: the file-arrival trigger starts
+# watching the prod incoming folder immediately. The tables themselves are only
+# created or updated when the pipeline runs, which is why a pipeline update is
+# offered as an opt-in manual step rather than running on every push.
+name: 'Production deployment'
+
+# One prod deploy at a time. Never cancel a deploy in flight -- an interrupted
+# `bundle deploy` can leave the workspace state file and the deployed resources
+# out of sync.
+concurrency:
+  group: prod-deploy-databricks-idp-test
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      # Bundle definition plus the two resource files it includes.
+      - 'databricks.yml'
+      - 'resources/**'
+      # Pipeline source: the pipeline's root_path and libraries glob both point
+      # into src/idp_etl, so any change here changes what prod runs.
+      - 'src/idp_etl/**'
+      # Serverless environment version and the dependency pins behind it.
+      - 'pyproject.toml'
+      - 'uv.lock'
+      # Redeploy when this workflow itself changes.
+      - '.github/workflows/prod_deployment.yml'
+
+  # Manual promotion, and the only way to trigger a pipeline update from CI.
+  workflow_dispatch:
+    inputs:
+      update_pipeline:
+        description: 'Run idp_etl after deploying, to process the prod incoming folder'
+        type: boolean
+        default: false
+      full_refresh_tables:
+        description: 'Tables to full-refresh first, comma-separated (e.g. silver_documents,silver_document_lines). Empty = normal update.'
+        type: string
+        default: ''
+
+env:
+  # The prod target pins its own host in databricks.yml, so only credentials
+  # are needed here. SP_TOKEN must belong to a principal that can write to
+  # /Workspace/Users/arijit.de@trinamix.com/.bundle/databricks-idp-test/prod
+  # and that is permitted to run the bundle as arijit.de@trinamix.com, since
+  # the prod target sets run_as to that user.
+  DATABRICKS_TOKEN: ${{ secrets.SP_TOKEN }}
+
+jobs:
+  deploy:
+    name: 'Deploy bundle to prod'
+    runs-on: ubuntu-latest
+
+    # Uncomment once a "prod" GitHub environment exists, to require a manual
+    # approval before anything touches the idp_test_prod catalog.
+    # environment: prod
+
+    steps:
+      # Check out this repo, so that this workflow can access it.
+      - uses: actions/checkout@v4
+
+      # Download the Databricks CLI.
+      # See https://github.com/databricks/setup-cli
+      - uses: databricks/setup-cli@main
+        with:
+          # Pinned to the version used for local deploys so that CI and a
+          # laptop deploy produce the same bundle.
+          version: 1.15.0
+
+      # Catch bad variable interpolation, a malformed trigger URL or a missing
+      # permission before anything is written to the workspace.
+      - name: Validate bundle
+        run: databricks bundle validate --target prod
+
+      - name: Deploy bundle
+        run: databricks bundle deploy --target prod
+
+      # Prints the resolved pipeline and job, including their workspace URLs.
+      - name: Show deployed resources
+        run: databricks bundle summary --target prod
+
+      - name: Update pipeline
+        if: github.event_name == 'workflow_dispatch' && inputs.update_pipeline
+        env:
+          # Read through the environment rather than interpolated into the
+          # script, so the input cannot inject shell.
+          FULL_REFRESH_TABLES: ${{ inputs.full_refresh_tables }}
+        run: |
+          if [ -n "$FULL_REFRESH_TABLES" ]; then
+            # Streaming tables are append-only, so changed transformation logic
+            # does not fix rows already written -- the named tables have to be
+            # reset. Keep the list narrow: refreshing the silver tables that
+            # hold ai_parse_document / ai_extract output re-invokes and re-bills
+            # those functions on every document in the catalog.
+            databricks bundle run idp_etl --target prod \
+              --full-refresh "$FULL_REFRESH_TABLES"
+          fi
+          # Always finish with a plain update. A selective full refresh does not
+          # cascade -- every table not named is logged EXCLUDED, downstream
+          # materialized views included -- so without this the gold layer keeps
+          # serving stale results.
+          databricks bundle run idp_etl --target prod
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Production deployment'
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Bundle | \`databricks-idp-test\` |"
+            echo "| Target | \`prod\` |"
+            echo "| Catalog | \`idp_test_prod\` |"
+            echo "| Schema | \`idp_test_project\` |"
+            echo "| Watched folder | \`/Volumes/idp_test_prod/idp_test_project/raw_documents/incoming/\` |"
+            echo "| Pipeline update | \`${{ inputs.update_pipeline || false }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
