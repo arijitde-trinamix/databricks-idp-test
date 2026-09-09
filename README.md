@@ -96,6 +96,8 @@ resources/
 src/idp_etl/transformations/
   idp_pipeline.py                             # all 12 table definitions
 sample_data/                                  # example documents to test with
+.github/workflows/
+  prod_deployment.yml                         # validates and deploys the prod target
 ```
 
 ## Environments
@@ -142,7 +144,78 @@ databricks fs cp sample_data/invoice_10119.pdf \
   dbfs:/Volumes/idp_test_dev/idp_test_project/raw_documents/incoming/
 ```
 
-Promote to prod with `databricks bundle deploy --target prod`.
+Promote to prod by merging into `main` — see
+[Continuous deployment](#continuous-deployment) below. A direct
+`databricks bundle deploy --target prod` still works, but it leaves no record
+of who deployed what.
+
+## Continuous deployment
+
+Prod is deployed by GitHub Actions rather than from a laptop.
+`.github/workflows/prod_deployment.yml` validates and deploys the bundle to the
+`prod` target whenever `main` moves, and only when something that actually
+changes prod is touched:
+
+```yaml
+paths:
+  - 'databricks.yml'        # bundle definition and target settings
+  - 'resources/**'          # the pipeline and the job carrying the trigger
+  - 'src/idp_etl/**'        # pipeline source: root_path and libraries glob
+  - 'pyproject.toml'        # serverless environment version and pins
+  - 'uv.lock'
+  - '.github/workflows/prod_deployment.yml'
+```
+
+A run does three things on a push, and one more only on request:
+
+| Step | Command | When |
+| --- | --- | --- |
+| Validate | `databricks bundle validate --target prod` | every run |
+| Deploy | `databricks bundle deploy --target prod` | every run |
+| Report | `databricks bundle summary --target prod` | every run |
+| Update pipeline | `databricks bundle run idp_etl --target prod` | manual dispatch only |
+
+Not updating the pipeline on every merge is deliberate. The deploy alone is
+enough to make prod live — the file-arrival trigger starts watching
+`/Volumes/idp_test_prod/idp_test_project/raw_documents/incoming/` as soon as
+the job exists — whereas an unconditional `bundle run` would re-invoke
+`ai_parse_document` and `ai_extract`, which are billed per document. Run it
+from the Actions tab when there is a backlog to process:
+
+| Dispatch input | Effect |
+| --- | --- |
+| `update_pipeline` | Run `idp_etl` once after deploying. Off by default. |
+| `full_refresh_tables` | Tables to full-refresh first, comma-separated, e.g. `silver_documents,silver_document_lines`. Empty means a normal update. |
+
+A plain `bundle run` always follows a selective full refresh, for the reason in
+operational note 4 below — otherwise the gold layer keeps serving stale results.
+
+### What the workflow needs
+
+One repository secret:
+
+| Secret | Value |
+| --- | --- |
+| `SP_TOKEN` | A Databricks token for the workspace, used as `DATABRICKS_TOKEN` |
+
+No `DATABRICKS_HOST` is set: the prod target pins its own host in
+`databricks.yml`. The principal behind `SP_TOKEN` needs write access to prod's
+pinned root path,
+`/Workspace/Users/arijit.de@trinamix.com/.bundle/databricks-idp-test/prod`, and
+permission to run the bundle as the user in prod's `run_as`. A service
+principal generally cannot impersonate a user, so if the deploy fails on
+`run_as`, switch that field to `service_principal_name` and give the principal
+`CAN_MANAGE` in the target's `permissions` block.
+
+Concurrency is a named group with `cancel-in-progress: false`, so deploys queue
+rather than interrupt each other — a cancelled `bundle deploy` can leave the
+workspace state file disagreeing with what is actually deployed. The job also
+has a commented-out `environment: prod`; uncomment it once that GitHub
+environment exists to require an approval before anything touches
+`idp_test_prod`.
+
+There is no workflow for the `dev` target. Dev is deployed from a laptop as
+shown above, so iterating does not require a push.
 
 ## Operational notes
 
