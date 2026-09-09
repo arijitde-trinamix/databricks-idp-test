@@ -1,0 +1,21 @@
+# The IDP document-processing pipeline.
+#
+# Serverless is required here: ai_parse_document and ai_extract only run on
+# serverless compute. The 'idp.source_path' configuration value is read by
+# src/idp_etl/transformations/idp_pipeline.py via spark.conf.get.
+
+resources:
+  pipelines:
+    idp_etl:
+      name: idp_etl
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      root_path: "../src/idp_etl"
+
+      libraries:
+        - glob:
+            include: ../src/idp_etl/transformations/**
+
+      configuration:
+        idp.source_path: ${var.source_path}

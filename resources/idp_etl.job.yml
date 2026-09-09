@@ -1,0 +1,36 @@
+# The job that runs the IDP pipeline whenever a new document lands in the
+# watched volume folder.
+#
+# A file-arrival trigger is a job-level feature -- it cannot be attached to a
+# pipeline directly -- so this job exists purely to carry the trigger and
+# refresh the pipeline.
+
+resources:
+  jobs:
+    idp_etl_job:
+      name: idp_etl_job
+
+      trigger:
+        # Set explicitly so the trigger stays live in the dev target, where
+        # 'mode: development' would otherwise pause it. Resource-level settings
+        # take precedence over deployment-mode presets.
+        pause_status: UNPAUSED
+        file_arrival:
+          # The trigger API requires a trailing slash on the watched folder.
+          url: ${var.source_path}/
+          # Databricks polls roughly once a minute. Debounce so that a batch of
+          # files copied together produces one run rather than one run per file.
+          wait_after_last_change_seconds: 60
+          min_time_between_triggers_seconds: 60
+
+      #email_notifications:
+      #  on_failure:
+      #    - arijit.de@trinamix.com
+
+      tasks:
+        - task_key: refresh_idp_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.idp_etl.id}
+
+      queue:
+        enabled: true
